@@ -1,0 +1,523 @@
+import asyncio
+import os
+import re
+import logging
+import types
+from pathlib import Path
+
+import aiohttp
+from io import BytesIO
+import textwrap
+from aiogram.types import Message, FSInputFile, BufferedInputFile
+from aiogram.fsm.state import StatesGroup, State
+from pptx import Presentation
+from pptx.enum.text import PP_ALIGN
+from pptx.util import Inches, Pt
+from pptx.dml.color import RGBColor
+from aiogram.filters import StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram import Router, F
+from loader import  bot
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+logging.basicConfig(level=logging.INFO)
+# API keys
+
+
+API_KEY = "sk-cb355fe140f84aad88999f6a3db45634"
+API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
+router = Router()
+# Bot setup
+
+
+
+# User states
+class PresState(StatesGroup):
+    topic = State()
+    author = State()
+    bg = State()
+    reja_mode = State()
+    reja = State()
+    slide_count = State()
+    bg_upload=State()
+
+
+user_data = {}
+
+
+async def ask_ai_content(topic: str, band: str, max_retries: int = 3) -> str:
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    prompt = (
+        f"Mavzu: {topic}. Band: {band}. Ushbu band bo'yicha 700-800 belgidan iborat to'liq va izohli matn yozing. "
+        "Matn bir nechta to'liq gap va paragraflardan iborat bo'lsin. "
+        "Matnda -=* kabi belgilar bo'lmasin. "
+        "Matn mantiqiy ravishda tugallangan bo'lsin."
+    )
+
+    for attempt in range(max_retries):
+        try:
+            data = {
+                "model": "qwen-turbo",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.7,
+                "max_tokens": 1000
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(API_URL, headers=headers, json=data) as resp:
+                    result = await resp.json()
+                    content = result['choices'][0]['message']['content'].strip()
+
+                    # Remove any special characters and extra newlines
+                    content = re.sub(r'[-=*]+', '', content)
+                    content = re.sub(r'\n+', '\n', content)
+
+                    # Check if content is complete
+                    if len(content) < 700:
+                        raise ValueError(f"Matn juda qisqa ({len(content)} belgi)")
+                    if len(content) > 800:
+                        content = content[:800]
+
+                    # Ensure the text ends with a proper sentence
+                    if not content.endswith(('.', '!', '?')):
+                        last_sentence_end = max(content.rfind('.'), content.rfind('!'), content.rfind('?'))
+                        if last_sentence_end > 0:
+                            content = content[:last_sentence_end + 1]
+
+                    return content
+
+        except Exception as e:
+            logging.warning(f"AI so'rovida xatolik (urunish {attempt + 1}/{max_retries}): {e}")
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(1)
+
+    raise Exception(f"{max_retries} marta urunishdan keyin ham matn olinmadi")
+
+
+async def generate_presentation(uid: int, message: Message):
+    data = user_data[uid]
+    topic = data["topic"]
+    author = data["author"]
+    # orqa=data["bg"]
+    # bg = FSInputFile(f"{orqa}.jpg")
+    bg=data["bg"]
+    reja = data["reja"]
+
+    prs = Presentation()
+    prs.slide_width = Inches(13.33)
+    prs.slide_height = Inches(7.5)
+
+    # Title slide
+
+
+    # Table of contents slide
+
+
+    total = len(reja)
+    progress_bar = lambda done: ''.join(['🟩' if i < done else '⬜️' for i in range(10)])
+
+    progress_msg = await message.answer("⏳ Tayyorlanmoqda...")
+
+    for idx, band in enumerate(reja):
+        try:
+            # Update progress
+            progress = (idx + 1) * 10 // total
+            await progress_msg.edit_text(f"⏳ Tayyorlanmoqda...\n\n{progress_bar(progress)} ({progress * 10}%)")
+
+            # Get content with retries
+            matn = await ask_ai_content(topic, band)
+
+            # Format the content
+            formatted_content = format_text(matn)
+
+            # Add slide
+            slide_title = f"{idx + 1}. {band}"
+            add_slide(prs, bg, slide_title, formatted_content)
+
+        except Exception as e:
+            logging.error(f"Xatolik yuz berdi (band: {band}): {e}")
+
+            # Try with a simpler prompt if the first attempt fails
+            try:
+                simple_matn = await ask_ai_content_simple(topic, band)
+                formatted_content = format_text(simple_matn)
+                slide_title = f"{idx + 1}. {band}"
+                add_slide(prs, bg, slide_title, formatted_content)
+                await message.answer(f"⚠️ '{band}' bandi uchun soddaroq matn qo'shildi")
+            except Exception as e2:
+                logging.error(f"Ikkinchi urunishda ham xatolik: {e2}")
+                await message.answer(f"⚠️ '{band}' bandida xatolik yuz berdi. Bo'sh slayd qo'shildi.")
+                slide_title = f"{idx + 1}. {band}"
+                add_slide(prs, bg, slide_title, "Ushbu band uchun matn yaratilmadi")
+            continue
+
+    buffer = BytesIO()
+    prs.save(buffer)
+    buffer.seek(0)
+    await message.answer_document(BufferedInputFile(buffer.read(), filename=f"{topic}.pptx"))
+
+
+async def ask_ai_content_simple(topic: str, band: str) -> str:
+    """Simpler version of content generation for fallback"""
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    prompt = f"Mavzu: {topic}. Band: {band}. Ushbu haqda qisqa matn yozing (300-500 belgi)."
+
+    data = {
+        "model": "qwen-turbo",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(API_URL, headers=headers, json=data) as resp:
+            result = await resp.json()
+            return result['choices'][0]['message']['content'].strip()
+
+
+
+
+
+def format_text(text: str, line_length: int = 90) -> str:
+    """Format text to have approximately line_length characters per line"""
+    lines = []
+    for paragraph in text.split('\n'):
+        if paragraph.strip():
+            wrapped = textwrap.fill(paragraph, width=line_length)
+            lines.append(wrapped)
+    return '\n'.join(lines)
+
+
+def add_slide(prs, bg_bytes, title, content=""):
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes.add_picture(BytesIO(bg_bytes), 0, 0, width=prs.slide_width, height=prs.slide_height)
+
+    if title:
+        title_box = slide.shapes.add_textbox(Inches(1), Inches(1), prs.slide_width - Inches(2), Inches(1))
+        tf = title_box.text_frame
+        tf.clear()
+        p = tf.paragraphs[0]
+        p.text = title
+        p.font.size = Pt(27)
+        p.font.bold = True
+        p.font.name = 'Vijaya'
+        p.font.color.rgb = RGBColor(0, 0, 0)
+
+    if content:
+        clean = re.sub(r'[-=*]+', '', content)
+        formatted_content = format_text(clean)
+        content_box = slide.shapes.add_textbox(Inches(1), Inches(2), prs.slide_width - Inches(2),
+                                               prs.slide_height - Inches(3))
+        tf = content_box.text_frame
+        tf.clear()
+        for line in formatted_content.split("\n"):
+            if line.strip():
+                p = tf.add_paragraph()
+                p.text = line.strip()
+                p.font.size = Pt(23)
+                p.font.name = 'Vijaya'
+                p.font.color.rgb = RGBColor(0, 0, 0)
+
+
+def add_title_slide(prs, bg_bytes, title, author):
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes.add_picture(BytesIO(bg_bytes), 0, 0, width=prs.slide_width, height=prs.slide_height)
+
+    # Title box (o'rtaga joylashtirilgan)
+    title_box = slide.shapes.add_textbox(Inches(2), Inches(2), prs.slide_width - Inches(4), Inches(2))
+    tf = title_box.text_frame
+    tf.clear()
+    p = tf.paragraphs[0]
+    p.text = title
+    p.alignment = PP_ALIGN.CENTER  # Markazga tekislash
+    p.font.size = Pt(44)
+    p.font.bold = True
+    p.font.name = 'Amasis MT Pro Black'
+    p.font.color.rgb = RGBColor(0, 0, 0)  # Qora rang
+
+    # Author box (title ostida, markazda)
+    author_box = slide.shapes.add_textbox(Inches(2), Inches(4.5), prs.slide_width - Inches(4), Inches(1))
+    af = author_box.text_frame
+    af.clear()
+    ap = af.paragraphs[0]
+    ap.text = f"Muallif: {author}"
+    ap.alignment = PP_ALIGN.CENTER
+    ap.font.size = Pt(32)
+    ap.font.name = 'Amasis MT Pro Black'
+    ap.font.color.rgb = RGBColor(0, 0, 0)
+
+async def generate_presentation(uid: int, message: Message):
+    data = user_data[uid]
+    topic = data["topic"]
+    author = data["author"]
+    bg = data["bg"]
+    reja = data["reja"]
+
+    prs = Presentation()
+    prs.slide_width = Inches(13.33)
+    prs.slide_height = Inches(7.5)
+
+    # Yangi title slide funksiyasini chaqiramiz
+    add_title_slide(prs, bg, topic, author)
+
+
+    reja_text = "\n" + "\n".join([f" {r}" for i, r in enumerate(reja)])
+    add_slide(prs, bg, "Reja", reja_text)
+
+    total = len(reja)
+    progress_bar = lambda done: ''.join(['🟩' if i < done else '⬜️' for i in range(10)])
+
+    progress_msg = await message.answer("⏳ Tayyorlanmoqda...")
+
+    for idx, band in enumerate(reja):
+        try:
+            # Progressni yangilash
+            progress = (idx + 1) * 10 // total
+            await progress_msg.edit_text(f"⏳ Tayyorlanmoqda...\n\n{progress_bar(progress)} ({progress * 10}%)")
+
+            # Matnni olish va formatlash
+            matn = await ask_ai_content(topic, band)
+
+
+            # Slaydga qo'shish
+            slide_title = f"{idx + 1}. {band}"
+            add_slide(prs, bg, slide_title, matn)
+
+        except Exception as e:
+            logging.error(f"Xatolik yuz berdi (band: {band}): {e}")
+            # Xatolik haqida foydalanuvchiga xabar berish
+            await message.answer(f"⚠️ '{band}' bandida xatolik yuz berdi. Boshqa matn bilan davom etilmoqda...")
+
+            # Bo'sh slayd qo'shish
+            slide_title = f"{idx + 1}. {band}"
+            add_slide(prs, bg, slide_title, "Ushbu band uchun matn yaratilmadi")
+            continue
+
+    buffer = BytesIO()
+    prs.save(buffer)
+    buffer.seek(0)
+    await message.answer_document(BufferedInputFile(buffer.read(), filename=f"{topic}.pptx"))
+
+
+
+@router.message(F.text=='/new')
+async def start(msg: Message ,state: FSMContext):
+    await msg.answer("📌 Prezentatsiya mavzusini kiriting:")
+    await state.set_state(PresState.topic)
+
+@router.callback_query(F.data=='taqdimot')
+async def start(msg:CallbackQuery, state: FSMContext):
+    await msg.message.answer("📌 Prezentatsiya mavzusini kiriting:")
+    await state.set_state(PresState.topic)
+
+
+@router.message(StateFilter(PresState.topic))
+async def get_topic(msg: Message, state: FSMContext):
+    user_data[msg.from_user.id] = {"topic": msg.text}
+    await msg.answer("✍️ Muallif ismini kiriting:")
+    await state.set_state(PresState.author)
+
+
+@router.message(StateFilter(PresState.author))
+async def get_author(msg: Message, state: FSMContext):
+    user_data[msg.from_user.id]["author"] = msg.text
+
+    # Create background selection buttons
+    inline_buttons = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="1", callback_data="bg_1"),
+            InlineKeyboardButton(text="2", callback_data="bg_2"),
+            InlineKeyboardButton(text="3", callback_data="bg_3"),
+            InlineKeyboardButton(text="4", callback_data="bg_4"),
+            InlineKeyboardButton(text="5", callback_data="bg_5")
+        ],
+        [
+            InlineKeyboardButton(text="6", callback_data="bg_6"),
+            InlineKeyboardButton(text="7", callback_data="bg_7"),
+            InlineKeyboardButton(text="8", callback_data="bg_8"),
+            InlineKeyboardButton(text="9", callback_data="bg_9"),
+            InlineKeyboardButton(text="10", callback_data="bg_10")
+        ],
+
+    ])
+
+    # Send sample image with background options
+    rasim_manzili=Path(r".\handlers\users\tanlov.jpg")
+    photo = FSInputFile(rasim_manzili)  # Make sure this file exists
+    await bot.send_photo(
+        chat_id=msg.from_user.id,
+        photo=photo,
+        caption="📸 Prezentatsiya fonini tanlang (1-10 raqamlardan birini tanlang yoki o'zingiz rasm yuboring):",
+        reply_markup=inline_buttons
+    )
+    await state.set_state(PresState.bg)
+
+
+@router.callback_query(StateFilter(PresState.bg), F.data.startswith("bg_"))
+async def handle_bg_selection(callback: CallbackQuery, state: FSMContext):
+    bg_number = callback.data.split("_")[1]  # Extract number from callback_data
+
+    try:
+        # Load selected background image
+        rasim_manzili = Path(rf".\handlers\users\rasimlar\{bg_number}.jpg")
+        bg_path = rasim_manzili  # Your background images path
+        with open(bg_path, "rb") as f:
+            user_data[callback.from_user.id]["bg"] = f.read()
+
+        await callback.message.delete()  # Remove the photo message with buttons
+        await callback.message.answer(f"✅ {bg_number}-fon tanlandi")
+
+        # Proceed to agenda selection
+        buttons = [
+            [InlineKeyboardButton(text="Ha 🤖", callback_data="ai_ha"),
+             InlineKeyboardButton(text="Yo'q ✍️", callback_data="ai_yoq")]
+        ]
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await callback.message.answer("🤖 Rejani AI yaratadimi?", reply_markup=markup)
+        await state.set_state(PresState.reja_mode)
+
+    except Exception as e:
+        logging.error(f"Background load error: {e}")
+        await callback.answer("❌ Fon yuklanmadi, qayta urining", show_alert=True)
+
+
+
+
+
+@router.message(StateFilter(PresState.bg_upload), F.photo)
+async def handle_uploaded_bg(msg: Message, state: FSMContext):
+    photo = msg.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    bg = await bot.download_file(file.file_path)
+    user_data[msg.from_user.id]["bg"] = bg.read()
+
+    await msg.answer("✅ Fon rasmi qabul qilindi")
+
+    # Proceed to agenda selection
+    buttons = [
+        [InlineKeyboardButton(text="Ha 🤖", callback_data="ai_ha"),
+         InlineKeyboardButton(text="Yo'q ✍️", callback_data="ai_yoq")]
+    ]
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await msg.answer("🤖 Rejani AI yaratadimi?", reply_markup=markup)
+    await state.set_state(PresState.reja_mode)
+
+
+@router.callback_query(F.data.in_(["ai_ha", "ai_yoq"]))
+async def handle_reja_mode(callback: CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    if callback.data == "ai_ha":
+        # Avval slaydlar sonini so'raymiz
+        await callback.message.answer("📄 Nechta slayd (faqat raqam):")
+        await state.set_state(PresState.slide_count)
+
+        # Holatda reja mode ni saqlaymiz
+        await state.update_data(reja_mode="ai")
+    else:
+        user_data[uid]["reja"] = []
+        await callback.message.answer(
+            "📝 Har bir reja bandini yangi qatorda kiriting. Tugatish uchun 'tayyor' deb yozing.")
+        await state.set_state(PresState.reja)
+        await state.update_data(reja_mode="manual")
+
+
+@router.message(StateFilter(PresState.slide_count))
+async def get_slide_count(msg: Message, state: FSMContext):
+    if not msg.text.isdigit():
+        await msg.answer("❌ Iltimos, faqat raqam kiriting!")
+        return
+
+    slide_count = int(msg.text)
+    if slide_count < 1:
+        await msg.answer("❌ Slaydlar soni 1 dan kam bo'lishi mumkin emas!")
+        return
+
+    data = await state.get_data()
+    uid = msg.from_user.id
+
+    if data.get("reja_mode") == "ai":
+        # AI reja generatsiyasi
+        topic = user_data[uid]["topic"]
+        prompt = (
+            f"'{topic}' mavzusi uchun {slide_count} ta reja bandini generatsiya qiling. "
+            "Har bir band yangi qatorda bo'lsin va 5-7 so'zdan iborat bo'lsin."
+        )
+
+        headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": "qwen-turbo",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(API_URL, headers=headers, json=data) as resp:
+                    result = await resp.json()
+                    reja = result['choices'][0]['message']['content'].split('\n')
+                    user_data[uid]["reja"] = [r.strip() for r in reja if r.strip()][:slide_count]
+
+
+            await msg.answer("⏳ Prezentatsiya tayyorlanmoqda, iltimos kuting...")
+            await generate_presentation(uid, msg)
+            await state.clear()
+
+        except Exception as e:
+            logging.error(f"Reja generatsiyasida xatolik: {e}")
+            await msg.answer("❌ Reja generatsiyasida xatolik yuz berdi. Qo'lda kiritishga harakat qiling.")
+            user_data[uid]["reja"] = []
+            await msg.answer("📝 Har bir reja bandini yangi qatorda kiriting. Tugatish uchun 'tayyor' deb yozing.")
+            await state.set_state(PresState.reja)
+
+    else:
+        # Qo'lda kiritilgan reja
+        if len(user_data[uid]["reja"]) > slide_count:
+            user_data[uid]["reja"] = user_data[uid]["reja"][:slide_count]
+            await msg.answer(f"⚠️ Reja {slide_count} ta bandga qisqartirildi")
+
+        await msg.answer("⏳ Prezentatsiya tayyorlanmoqda, iltimos kuting...")
+        await generate_presentation(uid, msg)
+        await state.clear()
+
+
+@router.message(StateFilter(PresState.reja))
+async def reja_input(msg: Message, state: FSMContext):
+    if msg.text.lower() == "tayyor":
+        if len(user_data[msg.from_user.id]["reja"]) == 0:
+            await msg.answer("❌ Kamida bitta reja bandini kiriting!")
+            return
+        await msg.answer("📄 Nechta slayd (faqat raqam):")
+        await state.set_state(PresState.slide_count)
+    else:
+        user_data[msg.from_user.id]["reja"].append(msg.text)
+
+
+@router.message(StateFilter(PresState.slide_count))
+async def get_slide_count(msg: Message, state: FSMContext):
+    if not msg.text.isdigit():
+        await msg.answer("❌ Iltimos, faqat raqam kiriting!")
+        return
+
+    slide_count = int(msg.text)
+    if slide_count < 1:
+        await msg.answer("❌ Slaydlar soni 1 dan kam bo'lishi mumkin emas!")
+        return
+
+    # Adjust reja if needed
+    if len(user_data[msg.from_user.id]["reja"]) > slide_count:
+        user_data[msg.from_user.id]["reja"] = user_data[msg.from_user.id]["reja"][:slide_count]
+        await msg.answer(f"⚠️ Reja {slide_count} ta bandga qisqartirildi")
+
+    await msg.answer("⏳ Prezentatsiya tayyorlanmoqda, iltimos kuting...")
+    await generate_presentation(msg.from_user.id, msg)
+    await state.clear()

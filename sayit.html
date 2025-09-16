@@ -1,0 +1,1705 @@
+// package.json
+{
+  "name": "service-order-system",
+  "version": "1.0.0",
+  "description": "Service order management system with authentication, payments, and real-time updates",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "seed": "node seedData.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "mongoose": "^7.5.0",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "cors": "^2.8.5",
+    "helmet": "^7.0.0",
+    "morgan": "^1.10.0",
+    "socket.io": "^4.7.2",
+    "dotenv": "^16.3.1",
+    "express-rate-limit": "^6.10.0",
+    "express-validator": "^7.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
+
+// server.js
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const rateLimit = require('express-rate-limit');
+const socketIO = require('socket.io');
+const http = require('http');
+require('dotenv').config();
+
+const authRoutes = require('./routes/auth');
+const orderRoutes = require('./routes/orders');
+const paymentRoutes = require('./routes/payments');
+const userRoutes = require('./routes/users');
+const { authenticateToken } = require('./middleware/auth');
+
+const app = express();
+const server = http.createServer(app);
+const io = socketIO(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+// Middleware
+app.use(helmet());
+app.use(morgan('combined'));
+app.use(cors());
+app.use(express.json());
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limit each IP to 100 requests per windowMs
+});
+app.use(limiter);
+
+// MongoDB connection
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/service_orders', {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+});
+
+mongoose.connection.on('connected', () => {
+  console.log('MongoDB ga muvaffaqiyatli ulandi');
+});
+
+mongoose.connection.on('error', (err) => {
+  console.error('MongoDB xatosi:', err);
+});
+
+// WebSocket connection handling
+const connectedUsers = new Map();
+
+io.on('connection', (socket) => {
+  console.log('Yangi foydalanuvchi ulandi:', socket.id);
+
+  socket.on('join', (userId) => {
+    connectedUsers.set(userId, socket.id);
+    socket.join(userId);
+    console.log(`Foydalanuvchi ${userId} qo'shildi`);
+  });
+
+  socket.on('disconnect', () => {
+    for (const [userId, socketId] of connectedUsers.entries()) {
+      if (socketId === socket.id) {
+        connectedUsers.delete(userId);
+        break;
+      }
+    }
+    console.log('Foydalanuvchi uzildi:', socket.id);
+  });
+});
+
+// Make io available to routes
+app.set('socketio', io);
+app.set('connectedUsers', connectedUsers);
+
+// Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/orders', authenticateToken, orderRoutes);
+app.use('/api/payments', authenticateToken, paymentRoutes);
+app.use('/api/users', authenticateToken, userRoutes);
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ 
+    success: false, 
+    message: 'Server xatosi yuz berdi',
+    error: process.env.NODE_ENV === 'development' ? err.message : 'Ichki server xatosi'
+  });
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+  res.status(404).json({ 
+    success: false, 
+    message: 'API endpoint topilmadi' 
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Server ${PORT} portda ishlamoqda`);
+});
+
+// models/User.js
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+
+const userSchema = new mongoose.Schema({
+  username: {
+    type: String,
+    required: true,
+    unique: true,
+    trim: true,
+    minlength: 3,
+    maxlength: 30
+  },
+  email: {
+    type: String,
+    required: true,
+    unique: true,
+    trim: true,
+    lowercase: true
+  },
+  password: {
+    type: String,
+    required: true,
+    minlength: 6
+  },
+  role: {
+    type: String,
+    enum: ['client', 'ishchi', 'admin'],
+    default: 'client'
+  },
+  specialization: {
+    type: String,
+    required: function() {
+      return this.role === 'ishchi';
+    },
+    enum: ['plumber', 'electrician', 'cleaner', 'carpenter', 'painter', 'mechanic']
+  },
+  phone: {
+    type: String,
+    trim: true
+  },
+  address: {
+    type: String,
+    trim: true
+  },
+  isActive: {
+    type: Boolean,
+    default: true
+  }
+}, {
+  timestamps: true
+});
+
+userSchema.pre('save', async function(next) {
+  if (!this.isModified('password')) return next();
+  
+  try {
+    const salt = await bcrypt.genSalt(12);
+    this.password = await bcrypt.hash(this.password, salt);
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
+userSchema.methods.comparePassword = async function(candidatePassword) {
+  return bcrypt.compare(candidatePassword, this.password);
+};
+
+userSchema.methods.toJSON = function() {
+  const user = this.toObject();
+  delete user.password;
+  return user;
+};
+
+module.exports = mongoose.model('User', userSchema);
+
+// models/Order.js
+const mongoose = require('mongoose');
+
+const orderSchema = new mongoose.Schema({
+  client: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  worker: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  },
+  service: {
+    type: String,
+    required: true,
+    enum: ['plumber', 'electrician', 'cleaner', 'carpenter', 'painter', 'mechanic']
+  },
+  description: {
+    type: String,
+    required: true,
+    maxlength: 500
+  },
+  address: {
+    type: String,
+    required: true
+  },
+  scheduledDate: {
+    type: Date,
+    required: true
+  },
+  price: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  status: {
+    type: String,
+    enum: ['pending', 'assigned', 'paid', 'in_progress', 'completed', 'canceled'],
+    default: 'pending'
+  },
+  paymentId: {
+    type: String
+  },
+  notes: {
+    type: String,
+    maxlength: 1000
+  }
+}, {
+  timestamps: true
+});
+
+// Index for efficient queries
+orderSchema.index({ client: 1, status: 1 });
+orderSchema.index({ worker: 1, status: 1 });
+orderSchema.index({ service: 1, status: 1 });
+
+module.exports = mongoose.model('Order', orderSchema);
+
+// models/Payment.js
+const mongoose = require('mongoose');
+
+const paymentSchema = new mongoose.Schema({
+  orderId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Order',
+    required: true
+  },
+  amount: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  paymentMethod: {
+    type: String,
+    enum: ['payme', 'click', 'card'],
+    required: true
+  },
+  status: {
+    type: String,
+    enum: ['pending', 'completed', 'failed', 'canceled'],
+    default: 'pending'
+  },
+  transactionId: {
+    type: String,
+    unique: true
+  },
+  cardNumber: {
+    type: String // Last 4 digits only for security
+  },
+  failureReason: {
+    type: String
+  }
+}, {
+  timestamps: true
+});
+
+module.exports = mongoose.model('Payment', paymentSchema);
+
+// middleware/auth.js
+const jwt = require('jsonwebtoken');
+const User = require('../models/User');
+
+const authenticateToken = async (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ 
+      success: false, 
+      message: 'Token talab qilinadi' 
+    });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const user = await User.findById(decoded.userId).select('-password');
+    
+    if (!user || !user.isActive) {
+      return res.status(401).json({ 
+        success: false, 
+        message: 'Foydalanuvchi topilmadi yoki faol emas' 
+      });
+    }
+
+    req.user = user;
+    next();
+  } catch (error) {
+    return res.status(403).json({ 
+      success: false, 
+      message: 'Token noto\'g\'ri' 
+    });
+  }
+};
+
+const authorize = (...roles) => {
+  return (req, res, next) => {
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Ruxsat berilmagan' 
+      });
+    }
+    next();
+  };
+};
+
+module.exports = { authenticateToken, authorize };
+
+// routes/auth.js
+const express = require('express');
+const jwt = require('jsonwebtoken');
+const { body, validationResult } = require('express-validator');
+const User = require('../models/User');
+const router = express.Router();
+
+// Register
+router.post('/register', [
+  body('username').isLength({ min: 3 }).withMessage('Username kamida 3 ta belgi bo\'lishi kerak'),
+  body('email').isEmail().withMessage('Email noto\'g\'ri formatda'),
+  body('password').isLength({ min: 6 }).withMessage('Parol kamida 6 ta belgi bo\'lishi kerak'),
+  body('role').isIn(['client', 'ishchi']).withMessage('Role client yoki ishchi bo\'lishi kerak')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validatsiya xatosi',
+        errors: errors.array()
+      });
+    }
+
+    const { username, email, password, role, specialization, phone, address } = req.body;
+
+    // Check if user exists
+    const existingUser = await User.findOne({ 
+      $or: [{ email }, { username }] 
+    });
+    
+    if (existingUser) {
+      return res.status(400).json({
+        success: false,
+        message: 'Foydalanuvchi allaqachon mavjud'
+      });
+    }
+
+    // Validate specialization for workers
+    if (role === 'ishchi' && !specialization) {
+      return res.status(400).json({
+        success: false,
+        message: 'Ishchi uchun mutaxassislik talab qilinadi'
+      });
+    }
+
+    const user = new User({
+      username,
+      email,
+      password,
+      role,
+      specialization,
+      phone,
+      address
+    });
+
+    await user.save();
+
+    const token = jwt.sign(
+      { userId: user._id, role: user.role },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '7d' }
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Foydalanuvchi muvaffaqiyatli ro\'yxatdan o\'tdi',
+      token,
+      user
+    });
+
+  } catch (error) {
+    console.error('Register error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server xatosi'
+    });
+  }
+});
+
+// Login
+router.post('/login', [
+  body('email').isEmail().withMessage('Email noto\'g\'ri formatda'),
+  body('password').notEmpty().withMessage('Parol talab qilinadi')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validatsiya xatosi',
+        errors: errors.array()
+      });
+    }
+
+    const { email, password } = req.body;
+
+    const user = await User.findOne({ email, isActive: true });
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: 'Email yoki parol noto\'g\'ri'
+      });
+    }
+
+    const isPasswordValid = await user.comparePassword(password);
+    if (!isPasswordValid) {
+      return res.status(401).json({
+        success: false,
+        message: 'Email yoki parol noto\'g\'ri'
+      });
+    }
+
+    const token = jwt.sign(
+      { userId: user._id, role: user.role },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '7d' }
+    );
+
+    res.json({
+      success: true,
+      message: 'Muvaffaqiyatli kirish',
+      token,
+      user
+    });
+
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server xatosi'
+    });
+  }
+});
+
+module.exports = router;
+
+// routes/orders.js
+const express = require('express');
+const { body, validationResult } = require('express-validator');
+const Order = require('../models/Order');
+const User = require('../models/User');
+const { authorize } = require('../middleware/auth');
+const router = express.Router();
+
+// Service prices (so'm)
+const SERVICE_PRICES = {
+  plumber: 150000,
+  electrician: 200000,
+  cleaner: 100000,
+  carpenter: 300000,
+  painter: 250000,
+  mechanic: 400000
+};
+
+// Create order
+router.post('/', [
+  authorize('client'),
+  body('service').isIn(Object.keys(SERVICE_PRICES)).withMessage('Noto\'g\'ri xizmat turi'),
+  body('description').isLength({ min: 10, max: 500 }).withMessage('Tavsif 10-500 belgi orasida bo\'lishi kerak'),
+  body('address').notEmpty().withMessage('Manzil talab qilinadi'),
+  body('scheduledDate').isISO8601().withMessage('Noto\'g\'ri sana formati')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validatsiya xatosi',
+        errors: errors.array()
+      });
+    }
+
+    const { service, description, address, scheduledDate, notes } = req.body;
+    
+    const scheduledDateTime = new Date(scheduledDate);
+    if (scheduledDateTime <= new Date()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Rejalashtirilgan sana kelajakda bo\'lishi kerak'
+      });
+    }
+
+    const price = SERVICE_PRICES[service];
+
+    const order = new Order({
+      client: req.user._id,
+      service,
+      description,
+      address,
+      scheduledDate: scheduledDateTime,
+      price,
+      notes
+    });
+
+    await order.save();
+    await order.populate('client', '-password');
+
+    // Find available workers for this service
+    const availableWorkers = await User.find({
+      role: 'ishchi',
+      specialization: service,
+      isActive: true
+    });
+
+    // Send real-time notification to workers
+    const io = req.app.get('socketio');
+    const connectedUsers = req.app.get('connectedUsers');
+
+    availableWorkers.forEach(worker => {
+      const socketId = connectedUsers.get(worker._id.toString());
+      if (socketId) {
+        io.to(socketId).emit('new_order', {
+          orderId: order._id,
+          service: order.service,
+          description: order.description,
+          address: order.address,
+          scheduledDate: order.scheduledDate,
+          price: order.price,
+          client: {
+            username: order.client.username,
+            phone: order.client.phone
+          }
+        });
+      }
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Buyurtma muvaffaqiyatli yaratildi',
+      order
+    });
+
+  } catch (error) {
+    console.error('Create order error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server xatosi'
+    });
+  }
+});
+
+// Get orders (with role-based filtering)
+router.get('/', async (req, res) => {
+  try {
+    const { status, page = 1, limit = 10 } = req.query;
+    const skip = (page - 1) * limit;
+
+    let query = {};
+    
+    // Role-based filtering
+    if (req.user.role === 'client') {
+      query.client = req.user._id;
+    } else if (req.user.role === 'ishchi') {
+      query.service = req.user.specialization;
+    }
+    // Admin can see all orders (no additional filtering)
+
+    if (status) {
+      query.status = status;
+    }
+
+    const orders = await Order.find(query)
+      .populate('client', '-password')
+      .populate('worker', '-password')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    const total = await Order.countDocuments(query);
+
+    res.json({
+      success: true,
+      orders,
+      pagination: {
+        currentPage: parseInt(page),
+        totalPages: Math.ceil(total / limit),
+        totalOrders: total,
+        hasMore: skip + orders.length < total
+      }
+    });
+
+  } catch (error) {
+    console.error('Get orders error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server xatosi'
+    });
+  }
+});
+
+// Get single order
+router.get('/:id', async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id)
+      .populate('client', '-password')
+      .populate('worker', '-password');
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Buyurtma topilmadi'
+      });
+    }
+
+    // Check permissions
+    if (req.user.role === 'client' && !order.client._id.equals(req.user._id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Ruxsat berilmagan'
+      });
+    }
+
+    if (req.user.role === 'ishchi' && order.service !== req.user.specialization) {
+      return res.status(403).json({
+        success: false,
+        message: 'Ruxsat berilmagan'
+      });
+    }
+
+    res.json({
+      success: true,
+      order
+    });
+
+  } catch (error) {
+    console.error('Get order error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server xatosi'
+    });
+  }
+});
+
+// Assign worker to order
+router.patch('/:id/assign', authorize('ishchi'), async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id);
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Buyurtma topilmadi'
+      });
+    }
+
+    if (order.service !== req.user.specialization) {
+      return res.status(403).json({
+        success: false,
+        message: 'Bu xizmat turi sizning mutaxassisligingizga mos kelmaydi'
+      });
+    }
+
+    if (order.status !== 'pending') {
+      return res.status(400).json({
+        success: false,
+        message: 'Bu buyurtma allaqachon tayinlangan yoki yakunlangan'
+      });
+    }
+
+    order.worker = req.user._id;
+    order.status = 'assigned';
+    await order.save();
+
+    await order.populate('client', '-password');
+    await order.populate('worker', '-password');
+
+    // Notify client
+    const io = req.app.get('socketio');
+    const connectedUsers = req.app.get('connectedUsers');
+    const clientSocketId = connectedUsers.get(order.client._id.toString());
+
+    if (clientSocketId) {
+      io.to(clientSocketId).emit('order_assigned', {
+        orderId: order._id,
+        worker: {
+          username: order.worker.username,
+          phone: order.worker.phone,
+          specialization: order.worker.specialization
+        },
+        message: 'Sizning buyurtmangizga ishchi tayinlandi'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Buyurtma muvaffaqiyatli qabul qilindi',
+      order
+    });
+
+  } catch (error) {
+    console.error('Assign order error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server xatosi'
+    });
+  }
+});
+
+// Update order status
+router.patch('/:id/status', async (req, res) => {
+  try {
+    const { status } = req.body;
+    const validStatuses = ['in_progress', 'completed', 'canceled'];
+
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Noto\'g\'ri status'
+      });
+    }
+
+    const order = await Order.findById(req.params.id)
+      .populate('client', '-password')
+      .populate('worker', '-password');
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Buyurtma topilmadi'
+      });
+    }
+
+    // Check permissions
+    if (req.user.role === 'ishchi' && !order.worker?._id.equals(req.user._id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Ruxsat berilmagan'
+      });
+    }
+
+    if (req.user.role === 'client' && !order.client._id.equals(req.user._id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Ruxsat berilmagan'
+      });
+    }
+
+    order.status = status;
+    await order.save();
+
+    // Send notification to relevant parties
+    const io = req.app.get('socketio');
+    const connectedUsers = req.app.get('connectedUsers');
+
+    const targetUserId = req.user.role === 'ishchi' 
+      ? order.client._id.toString()
+      : order.worker?._id.toString();
+
+    if (targetUserId) {
+      const socketId = connectedUsers.get(targetUserId);
+      if (socketId) {
+        io.to(socketId).emit('order_status_updated', {
+          orderId: order._id,
+          status: order.status,
+          message: `Buyurtma holati yangilandi: ${status}`
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      message: 'Buyurtma holati yangilandi',
+      order
+    });
+
+  } catch (error) {
+    console.error('Update order status error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server xatosi'
+    });
+  }
+});
+
+module.exports = router;
+
+// routes/payments.js
+const express = require('express');
+const { body, validationResult } = require('express-validator');
+const Order = require('../models/Order');
+const Payment = require('../models/Payment');
+const { authorize } = require('../middleware/auth');
+const router = express.Router();
+
+// Fake payment simulation function
+const simulatePayment = async (paymentMethod, amount, cardNumber) => {
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      // 80% success rate for simulation
+      const success = Math.random() < 0.8;
+      
+      if (success) {
+        resolve({
+          success: true,
+          transactionId: 'TXN' + Date.now() + Math.random().toString(36).substr(2, 9),
+          status: 'completed'
+        });
+      } else {
+        resolve({
+          success: false,
+          status: 'failed',
+          failureReason: 'Karta balansi yetarli emas'
+        });
+      }
+    }, 2000); // 2 second delay to simulate processing
+  });
+};
+
+// Process payment
+router.post('/:orderId/pay', [
+  authorize('client'),
+  body('paymentMethod').isIn(['payme', 'click', 'card']).withMessage('Noto\'g\'ri to\'lov usuli'),
+  body('cardNumber').matches(/^\d{16}$/).withMessage('Karta raqami 16 ta raqamdan iborat bo\'lishi kerak')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validatsiya xatosi',
+        errors: errors.array()
+      });
+    }
+
+    const { paymentMethod, cardNumber } = req.body;
+    const orderId = req.params.orderId;
+
+    // Find order
+    const order = await Order.findById(orderId).populate('client', '-password');
+    
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Buyurtma topilmadi'
+      });
+    }
+
+    // Check if user is the client of this order
+    if (!order.client._id.equals(req.user._id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Ruxsat berilmagan'
+      });
+    }
+
+    // Check if order can be paid
+    if (!['assigned', 'pending'].includes(order.status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Bu buyurtmani to\'lab bo\'lmaydi'
+      });
+    }
+
+    // Check if payment already exists
+    const existingPayment = await Payment.findOne({ 
+      orderId: orderId, 
+      status: { $in: ['completed', 'pending'] } 
+    });
+
+    if (existingPayment) {
+      return res.status(400).json({
+        success: false,
+        message: 'Bu buyurtma uchun to\'lov allaqachon amalga oshirilgan yoki jarayonda'
+      });
+    }
+
+    // Create payment record
+    const payment = new Payment({
+      orderId: order._id,
+      amount: order.price,
+      paymentMethod,
+      cardNumber: cardNumber.slice(-4), // Store only last 4 digits
+      status: 'pending'
+    });
+
+    await payment.save();
+
+    // Simulate payment processing
+    const paymentResult = await simulatePayment(paymentMethod, order.price, cardNumber);
+
+    // Update payment and order based on result
+    if (paymentResult.success) {
+      payment.status = 'completed';
+      payment.transactionId = paymentResult.transactionId;
+      await payment.save();
+
+      order.status = 'paid';
+      order.paymentId = payment.transactionId;
+      await order.save();
+
+      // Send notification to client and worker
+      const io = req.app.get('socketio');
+      const connectedUsers = req.app.get('connectedUsers');
+
+      // Notify client about payment failure
+      const io = req.app.get('socketio');
+      const connectedUsers = req.app.get('connectedUsers');
+      const clientSocketId = connectedUsers.get(order.client._id.toString());
+
+      if (clientSocketId) {
+        io.to(clientSocketId).emit('payment_failed', {
+          orderId: order._id,
+          reason: paymentResult.failureReason,
+          message: 'To\'lov amalga oshmadi'
+        });
+      }
+
+      res.status(400).json({
+        success: false,
+        message: 'To\'lov amalga oshmadi',
+        reason: paymentResult.failureReason
+      });
+    }
+
+  } catch (error) {
+    console.error('Payment error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server xatosi'
+    });
+  }
+});
+
+// Get payment history
+router.get('/history', async (req, res) => {
+  try {
+    const { page = 1, limit = 10 } = req.query;
+    const skip = (page - 1) * limit;
+
+    let query = {};
+    
+    if (req.user.role === 'client') {
+      // Get orders for this client
+      const clientOrders = await Order.find({ client: req.user._id }).select('_id');
+      const orderIds = clientOrders.map(order => order._id);
+      query.orderId = { $in: orderIds };
+    } else if (req.user.role === 'ishchi') {
+      // Get orders assigned to this worker
+      const workerOrders = await Order.find({ worker: req.user._id }).select('_id');
+      const orderIds = workerOrders.map(order => order._id);
+      query.orderId = { $in: orderIds };
+    }
+    // Admin can see all payments (no additional filtering)
+
+    const payments = await Payment.find(query)
+      .populate({
+        path: 'orderId',
+        populate: {
+          path: 'client worker',
+          select: '-password'
+        }
+      })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    const total = await Payment.countDocuments(query);
+
+    res.json({
+      success: true,
+      payments,
+      pagination: {
+        currentPage: parseInt(page),
+        totalPages: Math.ceil(total / limit),
+        totalPayments: total,
+        hasMore: skip + payments.length < total
+      }
+    });
+
+  } catch (error) {
+    console.error('Payment history error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server xatosi'
+    });
+  }
+});
+
+// Get payment details
+router.get('/:paymentId', async (req, res) => {
+  try {
+    const payment = await Payment.findById(req.params.paymentId)
+      .populate({
+        path: 'orderId',
+        populate: {
+          path: 'client worker',
+          select: '-password'
+        }
+      });
+
+    if (!payment) {
+      return res.status(404).json({
+        success: false,
+        message: 'To\'lov ma\'lumotlari topilmadi'
+      });
+    }
+
+    // Check permissions
+    const order = payment.orderId;
+    if (req.user.role === 'client' && !order.client._id.equals(req.user._id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Ruxsat berilmagan'
+      });
+    }
+
+    if (req.user.role === 'ishchi' && (!order.worker || !order.worker._id.equals(req.user._id))) {
+      return res.status(403).json({
+        success: false,
+        message: 'Ruxsat berilmagan'
+      });
+    }
+
+    res.json({
+      success: true,
+      payment
+    });
+
+  } catch (error) {
+    console.error('Get payment error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server xatosi'
+    });
+  }
+});
+
+module.exports = router;
+
+// routes/users.js
+const express = require('express');
+const User = require('../models/User');
+const Order = require('../models/Order');
+const { authorize } = require('../middleware/auth');
+const router = express.Router();
+
+// Get all users (Admin only)
+router.get('/', authorize('admin'), async (req, res) => {
+  try {
+    const { role, page = 1, limit = 20 } = req.query;
+    const skip = (page - 1) * limit;
+
+    let query = { isActive: true };
+    if (role && ['client', 'ishchi'].includes(role)) {
+      query.role = role;
+    }
+
+    const users = await User.find(query)
+      .select('-password')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    const total = await User.countDocuments(query);
+
+    // Get additional statistics for each user
+    const usersWithStats = await Promise.all(users.map(async (user) => {
+      const userObj = user.toObject();
+      
+      if (user.role === 'client') {
+        const orderStats = await Order.aggregate([
+          { $match: { client: user._id } },
+          {
+            $group: {
+              _id: null,
+              totalOrders: { $sum: 1 },
+              totalSpent: { $sum: '$price' },
+              completedOrders: {
+                $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] }
+              }
+            }
+          }
+        ]);
+        userObj.stats = orderStats[0] || { totalOrders: 0, totalSpent: 0, completedOrders: 0 };
+      } else if (user.role === 'ishchi') {
+        const workerStats = await Order.aggregate([
+          { $match: { worker: user._id } },
+          {
+            $group: {
+              _id: null,
+              totalOrders: { $sum: 1 },
+              totalEarned: { $sum: '$price' },
+              completedOrders: {
+                $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] }
+              }
+            }
+          }
+        ]);
+        userObj.stats = workerStats[0] || { totalOrders: 0, totalEarned: 0, completedOrders: 0 };
+      }
+
+      return userObj;
+    }));
+
+    res.json({
+      success: true,
+      users: usersWithStats,
+      pagination: {
+        currentPage: parseInt(page),
+        totalPages: Math.ceil(total / limit),
+        totalUsers: total,
+        hasMore: skip + users.length < total
+      }
+    });
+
+  } catch (error) {
+    console.error('Get users error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server xatosi'
+    });
+  }
+});
+
+// Get user profile
+router.get('/profile', async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id).select('-password');
+    
+    // Get user statistics
+    let stats = {};
+    if (user.role === 'client') {
+      const orderStats = await Order.aggregate([
+        { $match: { client: user._id } },
+        {
+          $group: {
+            _id: null,
+            totalOrders: { $sum: 1 },
+            totalSpent: { $sum: '$price' },
+            pendingOrders: {
+              $sum: { $cond: [{ $in: ['$status', ['pending', 'assigned', 'paid', 'in_progress']] }, 1, 0] }
+            },
+            completedOrders: {
+              $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] }
+            }
+          }
+        }
+      ]);
+      stats = orderStats[0] || { totalOrders: 0, totalSpent: 0, pendingOrders: 0, completedOrders: 0 };
+    } else if (user.role === 'ishchi') {
+      const workerStats = await Order.aggregate([
+        { $match: { worker: user._id } },
+        {
+          $group: {
+            _id: null,
+            totalOrders: { $sum: 1 },
+            totalEarned: { $sum: '$price' },
+            activeOrders: {
+              $sum: { $cond: [{ $in: ['$status', ['assigned', 'paid', 'in_progress']] }, 1, 0] }
+            },
+            completedOrders: {
+              $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] }
+            }
+          }
+        }
+      ]);
+      stats = workerStats[0] || { totalOrders: 0, totalEarned: 0, activeOrders: 0, completedOrders: 0 };
+    }
+
+    res.json({
+      success: true,
+      user: { ...user.toObject(), stats }
+    });
+
+  } catch (error) {
+    console.error('Get profile error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server xatosi'
+    });
+  }
+});
+
+// Update user profile
+router.put('/profile', async (req, res) => {
+  try {
+    const { username, phone, address } = req.body;
+    const updateData = {};
+
+    if (username) updateData.username = username;
+    if (phone) updateData.phone = phone;
+    if (address) updateData.address = address;
+
+    // Check if username is already taken
+    if (username) {
+      const existingUser = await User.findOne({ 
+        username, 
+        _id: { $ne: req.user._id } 
+      });
+      if (existingUser) {
+        return res.status(400).json({
+          success: false,
+          message: 'Bu username allaqachon band'
+        });
+      }
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.user._id,
+      updateData,
+      { new: true, runValidators: true }
+    ).select('-password');
+
+    res.json({
+      success: true,
+      message: 'Profil muvaffaqiyatli yangilandi',
+      user
+    });
+
+  } catch (error) {
+    console.error('Update profile error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server xatosi'
+    });
+  }
+});
+
+// Deactivate user (Admin only)
+router.patch('/:userId/deactivate', authorize('admin'), async (req, res) => {
+  try {
+    const user = await User.findByIdAndUpdate(
+      req.params.userId,
+      { isActive: false },
+      { new: true }
+    ).select('-password');
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'Foydalanuvchi topilmadi'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Foydalanuvchi deaktivlashtirildi',
+      user
+    });
+
+  } catch (error) {
+    console.error('Deactivate user error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server xatosi'
+    });
+  }
+});
+
+// Activate user (Admin only)
+router.patch('/:userId/activate', authorize('admin'), async (req, res) => {
+  try {
+    const user = await User.findByIdAndUpdate(
+      req.params.userId,
+      { isActive: true },
+      { new: true }
+    ).select('-password');
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'Foydalanuvchi topilmadi'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Foydalanuvchi aktivlashtirildi',
+      user
+    });
+
+  } catch (error) {
+    console.error('Activate user error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server xatosi'
+    });
+  }
+});
+
+// Get dashboard statistics (Admin only)
+router.get('/dashboard/stats', authorize('admin'), async (req, res) => {
+  try {
+    // Get user statistics
+    const userStats = await User.aggregate([
+      {
+        $group: {
+          _id: '$role',
+          count: { $sum: 1 },
+          active: { $sum: { $cond: ['$isActive', 1, 0] } }
+        }
+      }
+    ]);
+
+    // Get order statistics
+    const orderStats = await Order.aggregate([
+      {
+        $group: {
+          _id: '$status',
+          count: { $sum: 1 },
+          totalValue: { $sum: '$price' }
+        }
+      }
+    ]);
+
+    // Get monthly order trends
+    const monthlyStats = await Order.aggregate([
+      {
+        $group: {
+          _id: {
+            year: { $year: '$createdAt' },
+            month: { $month: '$createdAt' }
+          },
+          orders: { $sum: 1 },
+          revenue: { $sum: '$price' }
+        }
+      },
+      { $sort: { '_id.year': -1, '_id.month': -1 } },
+      { $limit: 12 }
+    ]);
+
+    // Get service popularity
+    const serviceStats = await Order.aggregate([
+      {
+        $group: {
+          _id: '$service',
+          count: { $sum: 1 },
+          revenue: { $sum: '$price' }
+        }
+      },
+      { $sort: { count: -1 } }
+    ]);
+
+    res.json({
+      success: true,
+      stats: {
+        users: userStats,
+        orders: orderStats,
+        monthly: monthlyStats.reverse(),
+        services: serviceStats
+      }
+    });
+
+  } catch (error) {
+    console.error('Dashboard stats error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server xatosi'
+    });
+  }
+});
+
+module.exports = router;
+
+// seedData.js
+const mongoose = require('mongoose');
+const User = require('./models/User');
+require('dotenv').config();
+
+const seedUsers = async () => {
+  try {
+    await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/service_orders');
+
+    // Create admin user
+    const adminUser = new User({
+      username: 'admin',
+      email: 'admin@example.com',
+      password: 'admin123',
+      role: 'admin',
+      phone: '+998901234567',
+      address: 'Toshkent, Uzbekiston'
+    });
+
+    // Create sample workers
+    const workers = [
+      {
+        username: 'plumber_ali',
+        email: 'ali@plumber.com',
+        password: 'worker123',
+        role: 'ishchi',
+        specialization: 'plumber',
+        phone: '+998902345678',
+        address: 'Toshkent'
+      },
+      {
+        username: 'electrician_bobur',
+        email: 'bobur@electric.com',
+        password: 'worker123',
+        role: 'ishchi',
+        specialization: 'electrician',
+        phone: '+998903456789',
+        address: 'Toshkent'
+      },
+      {
+        username: 'cleaner_malika',
+        email: 'malika@clean.com',
+        password: 'worker123',
+        role: 'ishchi',
+        specialization: 'cleaner',
+        phone: '+998904567890',
+        address: 'Toshkent'
+      }
+    ];
+
+    // Create sample clients
+    const clients = [
+      {
+        username: 'client_aziz',
+        email: 'aziz@client.com',
+        password: 'client123',
+        role: 'client',
+        phone: '+998905678901',
+        address: 'Mirzo Ulugbek tumani, Toshkent'
+      },
+      {
+        username: 'client_nodira',
+        email: 'nodira@client.com',
+        password: 'client123',
+        role: 'client',
+        phone: '+998906789012',
+        address: 'Yunusobod tumani, Toshkent'
+      }
+    ];
+
+    // Clear existing users
+    await User.deleteMany({});
+
+    // Save admin
+    await adminUser.save();
+    console.log('Admin foydalanuvchi yaratildi');
+
+    // Save workers
+    for (const workerData of workers) {
+      const worker = new User(workerData);
+      await worker.save();
+      console.log(`${workerData.specialization} ishchisi yaratildi: ${workerData.username}`);
+    }
+
+    // Save clients
+    for (const clientData of clients) {
+      const client = new User(clientData);
+      await client.save();
+      console.log(`Mijoz yaratildi: ${clientData.username}`);
+    }
+
+    console.log('Barcha test foydalanuvchilar muvaffaqiyatli yaratildi!');
+    console.log('\nLogin ma\'lumotlari:');
+    console.log('Admin: admin@example.com / admin123');
+    console.log('Plumber: ali@plumber.com / worker123');
+    console.log('Electrician: bobur@electric.com / worker123');
+    console.log('Cleaner: malika@clean.com / worker123');
+    console.log('Client 1: aziz@client.com / client123');
+    console.log('Client 2: nodira@client.com / client123');
+
+    process.exit(0);
+  } catch (error) {
+    console.error('Seed xatosi:', error);
+    process.exit(1);
+  }
+};
+
+seedUsers();
+
+// .env file template
+/*
+NODE_ENV=development
+PORT=3000
+MONGODB_URI=mongodb://localhost:27017/service_orders
+JWT_SECRET=your-super-secret-jwt-key-here-change-in-production
+*/
+
+// README.md
+/*
+# Service Order Management System
+
+Xizmat buyurtma boshqaruv tizimi - JWT authentication, to'lov tizimi va real-time xabarlar bilan.
+
+## Xususiyatlar
+
+- **Authentication & Authorization**: JWT token bilan login/register
+- **Role-based Access**: Client, Ishchi, Admin rollari
+- **Payment Integration**: Fake Payme/Click to'lov tizimi
+- **Real-time Notifications**: WebSocket orqali jonli xabarlar
+- **Order Management**: Buyurtma yaratish, tayinlash, kuzatish
+- **Admin Dashboard**: Statistika va foydalanuvchilarni boshqarish
+
+## Texnologiyalar
+
+- **Backend**: Node.js, Express.js
+- **Database**: MongoDB, Mongoose
+- **Authentication**: JWT
+- **Real-time**: Socket.IO
+- **Security**: Helmet, Rate limiting
+
+## O'rnatish
+
+1. Repository ni clone qiling
+2. Dependencies o'rnating:
+   ```bash
+   npm install
+   ```
+
+3. `.env` fayl yarating:
+   ```
+   NODE_ENV=development
+   PORT=3000
+   MONGODB_URI=mongodb://localhost:27017/service_orders
+   JWT_SECRET=your-super-secret-jwt-key
+   ```
+
+4. MongoDB ni ishga tushiring
+
+5. Test ma'lumotlarni yuklang:
+   ```bash
+   npm run seed
+   ```
+
+6. Serverni ishga tushiring:
+   ```bash
+   npm run dev
+   ```
+
+## API Endpoints
+
+### Authentication
+- `POST /api/auth/register` - Ro'yxatdan o'tish
+- `POST /api/auth/login` - Tizimga kirish
+
+### Orders
+- `GET /api/orders` - Buyurtmalar ro'yxati
+- `POST /api/orders` - Yangi buyurtma yaratish
+- `GET /api/orders/:id` - Buyurtma tafsilotlari
+- `PATCH /api/orders/:id/assign` - Buyurtmani qabul qilish
+- `PATCH /api/orders/:id/status` - Buyurtma holatini yangilash
+
+### Payments
+- `POST /api/payments/:orderId/pay` - To'lov amalga oshirish
+- `GET /api/payments/history` - To'lov tarixi
+- `GET /api/payments/:paymentId` - To'lov tafsilotlari
+
+### Users
+- `GET /api/users` - Barcha foydalanuvchilar (Admin)
+- `GET /api/users/profile` - Foydalanuvchi profili
+- `PUT /api/users/profile` - Profilni yangilash
+- `GET /api/users/dashboard/stats` - Admin statistikasi
+
+## Rollar va Ruxsatlar
+
+### Client
+- O'z buyurtmalarini yaratish va ko'rish
+- To'lov amalga oshirish
+- Buyurtma holatini kuzatish
+
+### Ishchi
+- O'z mutaxassisligi bo'yicha buyurtmalarni ko'rish
+- Buyurtmalarni qabul qilish
+- Buyurtma holatini yangilash
+
+### Admin
+- Barcha foydalanuvchilarni ko'rish va boshqarish
+- Barcha buyurtmalarni ko'rish
+- Tizim statistikasini ko'rish
+
+## WebSocket Events
+
+### Client Events
+- `new_order` - Yangi buyurtma (Ishchilarga)
+- `order_assigned` - Buyurtma tayinlandi (Clientga)
+- `order_status_updated` - Buyurtma holati yangilandi
+- `payment_success` - To'lov muvaffaqiyatli
+- `payment_failed` - To'lov amalga oshmadi
+
+## Xizmat Turlari va Narxlar
+
+- **Plumber (Santexnik)**: 150,000 so'm
+- **Electrician (Elektrchi)**: 200,000 so'm
+- **Cleaner (Tozalovchi)**: 100,000 so'm
+- **Carpenter (Duradgor)**: 300,000 so'm
+- **Painter (Bo'yovchi)**: 250,000 so'm
+- **Mechanic (Mexanik)**: 400,000 so'm
+
+## Test Foydalanuvchilar
+
+Seed script ishlagach quyidagi test foydalanuvchilar yaratiladi:
+
+- **Admin**: admin@example.com / admin123
+- **Plumber**: ali@plumber.com / worker123  
+- **Electrician**: bobur@electric.com / worker123
+- **Cleaner**: malika@clean.com / worker123
+- **Client 1**: aziz@client.com / client123
+- **Client 2**: nodira@client.com / client123
+
+## Development
+
+Development rejimida ishlatish uchun:
+
+```bash
+npm run dev
+```
+
+Bu nodemon bilan serverni ishga tushiradi va kod o'zgarishlarini avtomatik kuzatib turadi.
+*/ client
+      const clientSocketId = connectedUsers.get(order.client._id.toString());
+      if (clientSocketId) {
+        io.to(clientSocketId).emit('payment_success', {
+          orderId: order._id,
+          transactionId: payment.transactionId,
+          amount: payment.amount,
+          message: 'To\'lov muvaffaqiyatli amalga oshirildi'
+        });
+      }
+
+      // Notify worker if assigned
+      if (order.worker) {
+        const workerSocketId = connectedUsers.get(order.worker.toString());
+        if (workerSocketId) {
+          io.to(workerSocketId).emit('order_paid', {
+            orderId: order._id,
+            message: 'Buyurtma uchun to\'lov qabul qilindi'
+          });
+        }
+      }
+
+      res.json({
+        success: true,
+        message: 'To\'lov muvaffaqiyatli amalga oshirildi',
+        payment: {
+          transactionId: payment.transactionId,
+          amount: payment.amount,
+          status: payment.status
+        }
+      });
+
+    } else {
+      payment.status = 'failed';
+      payment.failureReason = paymentResult.failureReason;
+      await payment.save();
+
+      order.status = 'canceled';
+      await order.save();
